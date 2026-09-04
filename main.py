@@ -1,6 +1,8 @@
 import asyncio
 import sqlite3
 import datetime
+import os
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -9,7 +11,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-BOT_TOKEN = "8988963212:AAHy95addyo8bf3IIDIycr-HPHapVUuBe_c"
+load_dotenv()
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
@@ -35,7 +41,7 @@ class RentStates(StatesGroup):
     waiting_for_extra_days = State()  
     waiting_for_pin = State() # Тексты уведомлений на двух языках для клиентов
 TEXTS = {
-    "ru": { 
+    "ru": {
         "welcome": "🚲 Привет, {name}!\nДобро пожаловать в прокат.\n\nПередай владельцу свой **ID**: `{id}`.\nЯ сам автоматически напомню тебе, когда придет время внести еженедельную оплату!",
         "invoice": "🚲 *Оформлен долгосрочный контракт!*\n\n👤 Имя: *{c_name}*\n📅 Общий срок: *{total_days} дней*\n💳 Еженедельный платеж: *{amount} zł*\n⏳ Ближайшая оплата: *{date}*\n\nБот будет автоматически напоминать вам об оплате каждые 7 дней.",
         "remind": "🔔 *Напоминание о еженедельной оплате!*\n\nСегодня ({date}) необходимо внести оплату за велосипед по вашему контракту.\n🚲 Неделя: *{week_num} из {total_weeks}*\n💰 К оплате: *{amount} zł*.",
@@ -83,10 +89,12 @@ def get_admin_keyboard():
         keyboard=[
             [types.KeyboardButton(text="➕ Оформить гибкий контракт")],
             [types.KeyboardButton(text="📋 Список всех долгов")],
+            [types.KeyboardButton(text="📊 Статистика доходов")],  # <-- Новая кнопка
             [types.KeyboardButton(text="❌ Очистить всю базу")]
         ],
         resize_keyboard=True
     )
+
 
 def get_lang_keyboard():
     builder = InlineKeyboardBuilder()
@@ -336,23 +344,58 @@ async def cb_extend_rent(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(RentStates.waiting_for_extra_days)
     await callback.answer()
 
+@router.callback_query(F.data.startswith("extend_"))
+async def cb_extend_rent(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return
+    rent_id = int(callback.data.split("_")[-1])
+    await state.update_data(extend_rent_id=rent_id)
+    await callback.message.answer("На сколько **ДОПОЛНИТЕЛЬНЫХ дней** перенести срок?\n*(Введите число кратное 7, например: 7, 14, 21, 28):*")
+    await state.set_state(RentStates.waiting_for_extra_days)
+    await callback.answer()
+
 @router.message(RentStates.waiting_for_extra_days)
 async def process_extra_days(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS or not message.text.isdigit(): return
     extra_days = int(message.text)
+    
+    # Считаем, сколько дополнительных недель добавляется (округление вверх)
+    extra_weeks = (extra_days + 6) // 7
+    
     user_data = await state.get_data()
+    rent_id = user_data['extend_rent_id']
+    
     conn = sqlite3.connect("debts.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT return_date FROM rents WHERE id = ?", (user_data['extend_rent_id'],))
-    old_date_tuple = cursor.fetchone()
-    if old_date_tuple:
-        old_date = datetime.datetime.strptime(old_date_tuple[0], "%d.%m.%Y").date()
+    cursor.execute("SELECT return_date, total_weeks, amount FROM rents WHERE id = ?", (rent_id,))
+    rent_info = cursor.fetchone()
+    
+    if rent_info:
+        old_date_str, current_total_weeks, weekly_amount = rent_info
+        old_date = datetime.datetime.strptime(old_date_str, "%d.%m.%Y").date()
+        
+        # Сдвигаем дату и увеличиваем общее число недель
         new_date = (old_date + datetime.timedelta(days=extra_days)).strftime("%d.%m.%Y")
-        cursor.execute("UPDATE rents SET return_date = ?, is_notified = 0 WHERE id = ?", (new_date, user_data['extend_rent_id']))
+        new_total_weeks = current_total_weeks + extra_weeks
+        new_total_amount = weekly_amount * new_total_weeks
+        
+        # Обновляем все параметры контракта в базе данных
+        cursor.execute("""
+            UPDATE rents 
+            SET return_date = ?, total_weeks = ?, total_month_amount = ?, is_notified = 0 
+            WHERE id = ?
+        """, (new_date, new_total_weeks, new_total_amount, rent_id))
         conn.commit()
-        await message.answer(f"📅 Срок перенесен! Новая дата: {new_date}")
+        
+        await message.answer(
+            f"📅 *Срок контракта №{rent_id} успешно продлен!*\n"
+            f"➕ Добавлено: {extra_days} дн. (+{extra_weeks} нед.)\n"
+            f"📅 Новая дата платежа: {new_date}\n"
+            f"📊 Всего недель стало: {new_total_weeks}\n"
+            f"💰 Общая сумма контракта пересчитана: {new_total_amount} zł"
+        )
     conn.close()
     await state.clear()
+
 
 @router.message(F.text == "❌ Очистить всю базу")
 async def clear_debts_request(message: types.Message, state: FSMContext):
@@ -374,6 +417,38 @@ async def process_pin(message: types.Message, state: FSMContext):
         await message.answer("❌ *Неверный ПИН-код!* Действие отменено. База данных в безопасности.", reply_markup=get_admin_keyboard())
     await state.clear()
 
+@router.message(F.text == "📊 Статистика доходов")
+async def show_statistics(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS: return
+    
+    conn = sqlite3.connect("debts.db")
+    cursor = conn.cursor()
+    
+    # 1. Считаем общее количество контрактов
+    cursor.execute("SELECT COUNT(*) FROM rents")
+    total_contracts = cursor.fetchone()[0]
+    
+    # 2. Считаем сумму еженедельных платежей (сколько капает каждые 7 дней)
+    cursor.execute("SELECT SUM(amount) FROM rents")
+    weekly_flow = cursor.fetchone()[0] or 0
+    
+    # 3. Считаем общую стоимость всех контрактов за весь их срок
+    cursor.execute("SELECT SUM(total_month_amount) FROM rents")
+    total_projected = cursor.fetchone()[0] or 0
+    
+    conn.close()
+    
+    # Формируем красивый текст отчета
+    text = (
+        f"📊 *ФИНАНСОВАЯ СТАТИСТИКА ПРОКАТА*\n\n"
+        f"🚲 *Активных контрактов:* {total_contracts} шт.\n"
+        f"💳 *Ожидаемый доход в неделю:* {weekly_flow} zł\n"
+        f"💰 *Общая сумма всех контрактов:* {total_projected} zł\n\n"
+        f"📈 Бот успешно контролирует все выплаты!"
+    )
+    
+    await message.answer(text)
+
 async def main():
     init_db()
     dp.include_router(router)
@@ -385,4 +460,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
