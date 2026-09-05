@@ -1,0 +1,15 @@
+[Unit]
+Description=Bike Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/bike_bot
+ExecStart=/opt/bike_bot/.venv/bin/python /opt/bike_bot/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
