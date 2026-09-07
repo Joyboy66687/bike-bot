@@ -4,20 +4,38 @@ Oracle Cloud Free VM setup
 2. Connect over SSH and install Python:
 
    sudo apt update
-   sudo apt install -y python3-venv git
+   sudo apt install -y python3-venv git ufw
    sudo mkdir -p /opt/bike_bot
    sudo chown "$USER":"$USER" /opt/bike_bot
 
-3. Copy main.py, requirements.txt, bike-bot.service and your local debts.db
+3. Configure the firewall before enabling the service. SSH must be allowed first:
+
+   sudo ufw default deny incoming
+   sudo ufw default allow outgoing
+   sudo ufw allow OpenSSH
+   sudo ufw enable
+   sudo ufw status verbose
+
+   The bot uses Telegram polling, so it does not need an inbound application
+   port. Do not open ports 80 or 443 unless you add a separate web service.
+
+4. Copy main.py, requirements.txt, bike-bot.service and your local debts.db
    to /opt/bike_bot. Do not upload .env to GitHub.
-4. Create the environment file on the server:
+5. Create the environment file on the server:
 
    nano /opt/bike_bot/.env
 
    BOT_TOKEN=your_telegram_bot_token
    GROQ_API_KEY=your_groq_api_key
+   ADMIN_IDS=your_telegram_id
 
-5. Install dependencies and register the service:
+   Protect the secrets and private data:
+
+   chmod 600 /opt/bike_bot/.env
+   chmod 700 /opt/bike_bot
+   chmod 700 /opt/bike_bot/backups 2>/dev/null || true
+
+6. Install dependencies and register the service:
 
    cd /opt/bike_bot
    python3 -m venv .venv
@@ -26,7 +44,7 @@ Oracle Cloud Free VM setup
    sudo systemctl daemon-reload
    sudo systemctl enable --now bike-bot
 
-6. Check the bot:
+7. Check the bot:
 
    sudo systemctl status bike-bot
    journalctl -u bike-bot -f
