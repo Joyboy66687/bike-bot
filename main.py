@@ -32,8 +32,8 @@ try:
 except ValueError as error:
     raise RuntimeError("ADMIN_IDS должен содержать Telegram ID через запятую") from error
 
-if not BOT_TOKEN or not GROQ_API_KEY or not ADMIN_IDS:
-    raise RuntimeError("В .env должны быть заданы BOT_TOKEN, GROQ_API_KEY и ADMIN_IDS")
+if not BOT_TOKEN or not ADMIN_IDS:
+    raise RuntimeError("В .env должны быть заданы BOT_TOKEN и ADMIN_IDS")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,12 +52,14 @@ class RentStates(StatesGroup):
     waiting_for_deposit_amount = State()
     waiting_for_ai_prompt = State()
     waiting_for_ai_debtor = State()
-    waiting_for_clear_pin = State()
+    waiting_for_clear_confirmation = State()
     waiting_for_repair_debtor_name = State()
     waiting_for_repair_debtor_id = State()
     waiting_for_repair_amount = State()
     waiting_for_repair_description = State()
     waiting_for_repair_payment = State()
+    waiting_for_repair_writeoff_confirmation = State()
+    waiting_for_rent_cancel_confirmation = State()
 
  
 TEXTS = {
@@ -82,17 +84,26 @@ TEXTS = {
        
 
 def get_admin_keyboard():
+    keyboard = [
+        [types.KeyboardButton(text="➕ Оформить гибкий контракт")],
+        [types.KeyboardButton(text="📋 Список всех долгов")],
+        [types.KeyboardButton(text="🛠 Долги за ремонт")],
+        [types.KeyboardButton(text="💰 Пополнить баланс кошелька")],
+    ]
+    if GROQ_API_KEY:
+        keyboard.append([
+            types.KeyboardButton(text="🧠 ИИ-Помощник"),
+            types.KeyboardButton(text="📊 Статистика доходов"),
+        ])
+    else:
+        keyboard.append([types.KeyboardButton(text="📊 Статистика доходов")])
+    keyboard.extend([
+        [types.KeyboardButton(text="📜 История операций")],
+        [types.KeyboardButton(text="❌ Очистить всю базу")],
+        [types.KeyboardButton(text="⬅️ Назад в меню")],
+    ])
     return types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="➕ Оформить гибкий контракт")],
-            [types.KeyboardButton(text="📋 Список всех долгов")],
-            [types.KeyboardButton(text="🛠 Долги за ремонт")],
-            [types.KeyboardButton(text="💰 Пополнить баланс кошелька")],
-            [types.KeyboardButton(text="🧠 ИИ-Помощник"), types.KeyboardButton(text="📊 Статистика доходов")],
-            [types.KeyboardButton(text="📜 История операций")],
-            [types.KeyboardButton(text="❌ Очистить всю базу")],
-            [types.KeyboardButton(text="⬅️ Назад в меню")]
-        ],
+        keyboard=keyboard,
         resize_keyboard=True
     )
 
@@ -123,6 +134,8 @@ def init_db():
             current_week INTEGER DEFAULT 1,
             total_weeks INTEGER DEFAULT 4,
             is_notified INTEGER DEFAULT 0,
+            prepayment_notified INTEGER DEFAULT 0,
+            last_overdue_notified_at TEXT,
             status TEXT NOT NULL DEFAULT 'active'
         )
     """)
@@ -175,6 +188,7 @@ def init_db():
         "ALTER TABLE rents ADD COLUMN period_days INTEGER DEFAULT 7",
         "ALTER TABLE rents ADD COLUMN due_amount INTEGER",
         "ALTER TABLE rents ADD COLUMN prepayment_notified INTEGER DEFAULT 0",
+        "ALTER TABLE rents ADD COLUMN last_overdue_notified_at TEXT",
     ):
         try:
             cursor.execute(column_sql)
@@ -213,6 +227,27 @@ def record_operation(cursor, operation_key, operation_type, client_id, amount, d
         )
     )
     return cursor.rowcount == 1
+
+
+def parse_date(value):
+    return datetime.datetime.strptime(value, "%d.%m.%Y").date()
+
+
+def should_send_overdue_reminder(due_date, last_notified_at, today=None):
+    """Return whether an overdue payment needs a new notification today.
+
+    The first alert is sent immediately. After that the cadence is day 1, 3,
+    7 and then once per week, which keeps an unpaid contract visible without
+    flooding the client or owner every scheduler minute.
+    """
+    today = today or datetime.date.today()
+    if not last_notified_at:
+        return True
+    last_notified_date = parse_date(last_notified_at)
+    if last_notified_date >= today:
+        return False
+    days_overdue = max(0, (today - due_date).days)
+    return days_overdue in {1, 3, 7} or (days_overdue > 7 and (days_overdue - 7) % 7 == 0)
 
 def backup_database():
     database_path = DATABASE_PATH
@@ -345,7 +380,8 @@ async def process_repair_wallet_payments(cursor):
 async def check_deadlines():
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
-    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    today = datetime.date.today()
+    tomorrow = today + datetime.timedelta(days=1)
 
     cursor.execute(
         "SELECT id, client_id, client_name, due_amount, return_date, current_week, total_weeks, period_days "
@@ -353,7 +389,7 @@ async def check_deadlines():
     )
     upcoming_rents = [
         rent for rent in cursor.fetchall()
-        if datetime.datetime.strptime(rent[4], "%d.%m.%Y").date() == tomorrow
+        if parse_date(rent[4]) == tomorrow
     ]
 
     for rent_id, client_id, client_name, due_amount, return_date, current_week, total_weeks, period_days in upcoming_rents:
@@ -397,16 +433,16 @@ async def check_deadlines():
             cursor.execute("UPDATE rents SET prepayment_notified = 1 WHERE id = ?", (rent_id,))
     
     cursor.execute(
-        "SELECT id, client_id, client_name, amount, due_amount, return_date, current_week, total_weeks, paid_days, period_days, total_days "
-        "FROM rents WHERE is_notified = 0 AND status = 'active'"
+        "SELECT id, client_id, client_name, amount, due_amount, return_date, current_week, total_weeks, paid_days, period_days, total_days, last_overdue_notified_at "
+        "FROM rents WHERE status = 'active'"
     )
     active_rents = [
         rent for rent in cursor.fetchall()
-        if datetime.datetime.strptime(rent[5], "%d.%m.%Y").date() <= datetime.date.today()
+        if parse_date(rent[5]) <= today
     ]
     
     for rent in active_rents:
-        rent_id, client_id, client_name, weekly_amount, due_amount, return_date, current_week, total_weeks, paid_days, period_days, total_days = rent
+        rent_id, client_id, client_name, weekly_amount, due_amount, return_date, current_week, total_weeks, paid_days, period_days, total_days, last_overdue_notified_at = rent
         due_amount = due_amount or weekly_amount
         
         cursor.execute("SELECT lang, balance FROM clients WHERE tg_id = ?", (client_id,))
@@ -424,12 +460,17 @@ async def check_deadlines():
             
             if new_paid_days < total_days:
                 next_week = current_week + 1
-                old_date = datetime.datetime.strptime(return_date, "%d.%m.%Y").date()
+                old_date = parse_date(return_date)
                 next_period_days = min(7, total_days - new_paid_days)
                 next_due_amount = math.ceil(weekly_amount * next_period_days / 7)
                 new_date = (old_date + datetime.timedelta(days=next_period_days)).strftime("%d.%m.%Y")
                 
-                cursor.execute("UPDATE rents SET current_week = ?, paid_days = ?, period_days = ?, due_amount = ?, return_date = ?, is_notified = 0, prepayment_notified = 0 WHERE id = ?", (next_week, new_paid_days, next_period_days, next_due_amount, new_date, rent_id))
+                cursor.execute(
+                    "UPDATE rents SET current_week = ?, paid_days = ?, period_days = ?, due_amount = ?, "
+                    "return_date = ?, is_notified = 0, prepayment_notified = 0, "
+                    "last_overdue_notified_at = NULL WHERE id = ?",
+                    (next_week, new_paid_days, next_period_days, next_due_amount, new_date, rent_id),
+                )
                 
                 try:
                     msg_client = (
@@ -455,17 +496,55 @@ async def check_deadlines():
                         await bot.send_message(chat_id=admin_id, text=f"🎉 *Контракт №{rent_id} полностью закрыт!*\n👤 *Клиент:* {client_name}\nВся сумма за весь срок успешно выплачена через кошелёк.")
                     except: pass
         else:
-            try:
-                await bot.send_message(chat_id=client_id, text=TEXTS[lang]["remind"].format(date=return_date, week_num=current_week, total_weeks=total_weeks, amount=due_amount) + f"\n\n⚠️ _На вашем кошельке недостаточно средств ({balance} zł). Пожалуйста, пополните баланс через администратора!_")
-            except Exception:
+            due_date = parse_date(return_date)
+            if not should_send_overdue_reminder(due_date, last_overdue_notified_at, today):
                 continue
+
+            days_overdue = max(0, (today - due_date).days)
+            overdue_note = (
+                "Сегодня дата списания."
+                if days_overdue == 0
+                else f"Платёж просрочен на {days_overdue} дн."
+            )
+            notification_sent = False
+            try:
+                await bot.send_message(
+                    chat_id=client_id,
+                    text=(
+                        TEXTS[lang]["remind"].format(
+                            date=return_date,
+                            week_num=current_week,
+                            total_weeks=total_weeks,
+                            amount=due_amount,
+                        )
+                        + f"\n\n⚠️ _{overdue_note} На вашем кошельке недостаточно средств ({balance} zł). "
+                        "Пожалуйста, пополните баланс через администратора!_"
+                    ),
+                )
+                notification_sent = True
+            except Exception:
+                logger.warning("Не удалось отправить напоминание клиенту %s", client_id)
 
             for admin_id in ADMIN_IDS:
                 try:
-                    await bot.send_message(chat_id=admin_id, text=f"⚠️ *Долг! Недостаточно средств на кошельке!*\n\n🆔 *Контракт:* {rent_id}\n👤 *Клиент:* {client_name}\n🚲 *Период:* {period_days} дн.\n💰 *Требуется:* {due_amount} zł\n🎒 *Баланс кошелька:* {balance} zł")
+                    await bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            "⚠️ *Долг! Недостаточно средств на кошельке!*\n\n"
+                            f"🆔 *Контракт:* {rent_id}\n👤 *Клиент:* {client_name}\n"
+                            f"⏱ *Статус:* {overdue_note}\n🚲 *Период:* {period_days} дн.\n"
+                            f"💰 *Требуется:* {due_amount} zł\n🎒 *Баланс кошелька:* {balance} zł"
+                        ),
+                    )
+                    notification_sent = True
                 except Exception:
-                    pass
-            cursor.execute("UPDATE rents SET is_notified = 1 WHERE id = ?", (rent_id,))
+                    logger.warning("Не удалось отправить напоминание администратору %s", admin_id)
+
+            if notification_sent:
+                cursor.execute(
+                    "UPDATE rents SET is_notified = 1, last_overdue_notified_at = ? WHERE id = ?",
+                    (today.strftime("%d.%m.%Y"), rent_id),
+                )
 
     await process_repair_wallet_payments(cursor)
             
@@ -562,32 +641,44 @@ async def process_client_name(message: types.Message, state: FSMContext):
 
 @router.message(RentStates.waiting_for_name)
 async def process_client_id(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS or not message.text.isdigit(): return
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not message.text or not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("❌ Введите положительный числовой Telegram ID клиента.")
+        return
     await state.update_data(c_id=int(message.text))
     await message.answer("💰 Шаг 3: Введите **цену за 1 неделю** аренды (в zł):")
     await state.set_state(RentStates.waiting_for_amount)
 
 @router.message(RentStates.waiting_for_amount)
 async def process_amount(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS or not message.text.isdigit(): return
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not message.text or not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("❌ Введите положительный тариф за неделю целым числом.")
+        return
     await state.update_data(amount=int(message.text))
     await message.answer("⏳ Шаг 4: На сколько **ДНЕЙ** оформляется аренда?\n*(Например: 90 дней):*")
     await state.set_state(RentStates.waiting_for_duration)
 
 @router.message(RentStates.waiting_for_duration)
 async def process_duration(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS or not message.text.isdigit(): return
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    if not message.text or not message.text.isdigit():
+        await message.answer("❌ Введите срок аренды положительным целым числом дней.")
+        return
     total_days = int(message.text)
-    if total_days < 0:
-        await message.answer("❌ Срок не может быть отрицательным.")
+    if total_days <= 0:
+        await message.answer("❌ Срок аренды должен быть хотя бы 1 день.")
         return
     weeks = max(1, math.ceil(total_days / 7))
     data = await state.get_data()
     weekly_amount = data['amount']
-    period_days = min(7, total_days) if total_days else 1
+    period_days = min(7, total_days)
     due_amount = math.ceil(weekly_amount * period_days / 7)
     client_id = data['c_id']
-    total_month_amount = math.ceil(weekly_amount * total_days / 7) if total_days else due_amount
+    total_month_amount = math.ceil(weekly_amount * total_days / 7)
     
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
@@ -597,9 +688,7 @@ async def process_duration(message: types.Message, state: FSMContext):
     lang = c_res[1] if c_res else "ru"
     
     start_date = datetime.date.today()
-    return_date = (
-        start_date if total_days == 0 else start_date + datetime.timedelta(days=7)
-    ).strftime("%d.%m.%Y")
+    return_date = (start_date + datetime.timedelta(days=period_days)).strftime("%d.%m.%Y")
     
     cursor.execute("""
         INSERT INTO rents (client_id, client_name, amount, return_date, total_month_amount, total_days, paid_days, period_days, due_amount, current_week, total_weeks, is_notified, status)
@@ -613,8 +702,6 @@ async def process_duration(message: types.Message, state: FSMContext):
     try:
         await bot.send_message(chat_id=client_id, text=TEXTS[lang]["invoice"].format(c_name=c_name, total_days=total_days, amount=weekly_amount, date=return_date))
     except: pass
-    if total_days == 0:
-        await check_deadlines()
     await state.clear()
 
 @router.message(F.text == "📋 Список всех долгов")
@@ -928,7 +1015,7 @@ async def exit_repair_debts(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @router.callback_query(F.data.startswith("close_"))
-async def cb_close_rent(callback: types.CallbackQuery):
+async def cb_close_rent(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
     await state.clear()
     rent_id = int(callback.data.split("_")[-1])
@@ -961,11 +1048,16 @@ async def cb_close_rent(callback: types.CallbackQuery):
         new_paid_days = paid_days + period_days
         if new_paid_days < total_days:
             next_week = current_week + 1
-            old_date = datetime.datetime.strptime(old_date_str, "%d.%m.%Y").date()
+            old_date = parse_date(old_date_str)
             next_period_days = min(7, total_days - new_paid_days)
             next_due_amount = math.ceil(weekly_amount * next_period_days / 7)
             new_date = (old_date + datetime.timedelta(days=next_period_days)).strftime("%d.%m.%Y")
-            cursor.execute("UPDATE rents SET current_week = ?, paid_days = ?, period_days = ?, due_amount = ?, return_date = ?, is_notified = 0 WHERE id = ?", (next_week, new_paid_days, next_period_days, next_due_amount, new_date, rent_id))
+            cursor.execute(
+                "UPDATE rents SET current_week = ?, paid_days = ?, period_days = ?, due_amount = ?, "
+                "return_date = ?, is_notified = 0, prepayment_notified = 0, "
+                "last_overdue_notified_at = NULL WHERE id = ?",
+                (next_week, new_paid_days, next_period_days, next_due_amount, new_date, rent_id),
+            )
             await callback.message.edit_text(f"💳 Оплачено {period_days} дн. на сумму {due_amount} zł! Следующий период: {next_period_days} дн. (до {new_date}).")
             for admin_id in ADMIN_IDS:
                 try:
