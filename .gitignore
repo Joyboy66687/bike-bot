@@ -1,5 +1,7 @@
 .env
 .env.*
+!.env.example
+.backup_passphrase
 __pycache__/
 *.pyc
 debts.db

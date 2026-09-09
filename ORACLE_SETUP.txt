@@ -4,7 +4,7 @@ Oracle Cloud Free VM setup
 2. Connect over SSH and install Python:
 
    sudo apt update
-   sudo apt install -y python3-venv git ufw
+   sudo apt install -y python3-venv git ufw gnupg2 curl
    sudo mkdir -p /opt/bike_bot
    sudo chown "$USER":"$USER" /opt/bike_bot
 
@@ -35,6 +35,16 @@ Oracle Cloud Free VM setup
    chmod 700 /opt/bike_bot
    chmod 700 /opt/bike_bot/backups 2>/dev/null || true
 
+   Для off-site резервных копий создайте отдельную passphrase (не коммитьте её):
+
+   umask 077
+   openssl rand -base64 32 > /opt/bike_bot/.backup_passphrase
+   chmod 600 /opt/bike_bot/.backup_passphrase
+
+   Планировщик шифрует последний дамп через `gpg` и отправляет его
+   администраторам Telegram раз в сутки. Если passphrase отсутствует, отправка
+   пропускается без изменения локальных бэкапов.
+
 6. Install dependencies and register the service:
 
    cd /opt/bike_bot
@@ -51,3 +61,22 @@ Oracle Cloud Free VM setup
 
 Only one copy of the bot may run at a time. Stop the local Windows copy
 before starting the server copy, otherwise Telegram will report a conflict.
+
+## Внешние ключи и существующая база
+
+Новые установки получают `PRAGMA foreign_keys=ON` и связи `rents.client_id`
+и `repair_debts.client_id` с `clients.tg_id`. SQLite не добавляет такие FK в
+уже существующие таблицы через `ALTER TABLE`; для production `debts.db`
+нужна ручная миграция через `CREATE TABLE new_...`, `INSERT ... SELECT`,
+`DROP TABLE` и `ALTER TABLE ... RENAME TO ...` после проверки сиротских строк.
+
+## Мониторинг рестартов
+
+Сделайте скрипт исполняемым и добавьте cron раз в 10 минут:
+
+    sudo install -m 750 monitor_restarts.sh /usr/local/sbin/bike-bot-restarts
+    sudo crontab -e
+    */10 * * * * /usr/local/sbin/bike-bot-restarts
+
+Скрипт сравнивает `NRestarts` с предыдущим запуском и отправляет алерт
+администраторам при скачке на 3 и более (порог меняется через `ALERT_THRESHOLD`).
