@@ -50,7 +50,9 @@ pip install -r requirements.txt
 ```env
 BOT_TOKEN=токен_от_BotFather
 GROQ_API_KEY=ключ_Groq
+GROQ_MODEL=openai/gpt-oss-20b
 ADMIN_IDS=123456789,987654321
+CLEAR_DB_PIN=7777
 ```
 
 Секреты нельзя добавлять в Git или отправлять в сообщения. Файл `.env`,

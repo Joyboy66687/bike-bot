@@ -5,10 +5,12 @@ import math
 import os
 import warnings
 import logging
+import re
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, types, F
-from aiogram.filters import CommandStart
+from aiogram.filters import BaseFilter, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.client.default import DefaultBotProperties
@@ -32,8 +34,8 @@ try:
 except ValueError as error:
     raise RuntimeError("ADMIN_IDS должен содержать Telegram ID через запятую") from error
 
-if not BOT_TOKEN or not ADMIN_IDS:
-    raise RuntimeError("В .env должны быть заданы BOT_TOKEN и ADMIN_IDS")
+if not BOT_TOKEN or not GROQ_API_KEY or not ADMIN_IDS:
+    raise RuntimeError("В .env должны быть заданы BOT_TOKEN, GROQ_API_KEY и ADMIN_IDS")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,7 +43,22 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 router = Router()
-dp.include_router(router)
+admin_router = Router()
+TZ = ZoneInfo("Europe/Warsaw")
+
+
+class IsAdmin(BaseFilter):
+    async def __call__(self, event) -> bool:
+        return event.from_user.id in ADMIN_IDS
+
+
+admin_router.message.filter(IsAdmin(), F.chat.type == "private")
+admin_router.callback_query.filter(IsAdmin(), F.message.chat.type == "private")
+router.message.filter(F.chat.type == "private")
+
+
+def escape_md(text: str) -> str:
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', str(text))
 
 class RentStates(StatesGroup):
     waiting_for_client_name = State()
@@ -52,6 +69,7 @@ class RentStates(StatesGroup):
     waiting_for_deposit_amount = State()
     waiting_for_ai_prompt = State()
     waiting_for_ai_debtor = State()
+    waiting_for_clear_pin = State()
     waiting_for_clear_confirmation = State()
     waiting_for_repair_debtor_name = State()
     waiting_for_repair_debtor_id = State()
@@ -229,6 +247,51 @@ def record_operation(cursor, operation_key, operation_type, client_id, amount, d
     return cursor.rowcount == 1
 
 
+def charge_rent_period(cursor, rent: dict, source: str) -> dict | None:
+    due_amount = rent["due_amount"] or rent["amount"]
+    operation_key = f"rent:{rent['id']}:{rent['paid_days']}:{rent['period_days']}"
+    if source != "auto":
+        operation_key += f":{source}"
+    cursor.execute("SELECT balance FROM clients WHERE tg_id = ?", (rent["client_id"],))
+    balance_row = cursor.fetchone()
+    balance = balance_row[0] if balance_row else 0
+    if balance < due_amount:
+        return None
+    if not record_operation(
+        cursor, operation_key, f"rent_payment_{source}", rent["client_id"],
+        due_amount, f"Аренда №{rent['id']}, {rent['period_days']} дн."
+    ):
+        return None
+    new_balance = balance - due_amount
+    cursor.execute("UPDATE clients SET balance = ? WHERE tg_id = ?", (new_balance, rent["client_id"]))
+    new_paid_days = rent["paid_days"] + rent["period_days"]
+    if new_paid_days < rent["total_days"]:
+        next_period_days = min(7, rent["total_days"] - new_paid_days)
+        next_due_amount = math.ceil(rent["amount"] * next_period_days / 7)
+        new_date = (
+            parse_date(rent["return_date"]) + datetime.timedelta(days=next_period_days)
+        ).strftime("%d.%m.%Y")
+        cursor.execute(
+            "UPDATE rents SET current_week = ?, paid_days = ?, period_days = ?, due_amount = ?, "
+            "return_date = ?, is_notified = 0, prepayment_notified = 0, "
+            "last_overdue_notified_at = NULL WHERE id = ?",
+            (rent["current_week"] + 1, new_paid_days, next_period_days, next_due_amount, new_date, rent["id"]),
+        )
+        next_date, completed = new_date, False
+    else:
+        new_paid_days = rent["total_days"]
+        cursor.execute(
+            "UPDATE rents SET status = 'completed', paid_days = ?, is_notified = 1 WHERE id = ?",
+            (new_paid_days, rent["id"]),
+        )
+        next_date, completed = None, True
+    return {
+        "completed": completed, "new_balance": new_balance, "new_paid_days": new_paid_days,
+        "next_date": next_date, "charged": due_amount, "client_id": rent["client_id"],
+        "client_name": rent["client_name"], "rent_id": rent["id"],
+    }
+
+
 def parse_date(value):
     return datetime.datetime.strptime(value, "%d.%m.%Y").date()
 
@@ -240,7 +303,7 @@ def should_send_overdue_reminder(due_date, last_notified_at, today=None):
     7 and then once per week, which keeps an unpaid contract visible without
     flooding the client or owner every scheduler minute.
     """
-    today = today or datetime.date.today()
+    today = today or datetime.datetime.now(TZ).date()
     if not last_notified_at:
         return True
     last_notified_date = parse_date(last_notified_at)
@@ -253,7 +316,7 @@ def backup_database():
     database_path = DATABASE_PATH
     backup_dir = BASE_DIR / "backups"
     backup_dir.mkdir(exist_ok=True)
-    backup_path = backup_dir / f"debts_{datetime.date.today().isoformat()}.db"
+    backup_path = backup_dir / f"debts_{datetime.datetime.now(TZ).date().isoformat()}.db"
     source = sqlite3.connect(database_path)
     target = sqlite3.connect(backup_path)
     try:
@@ -266,7 +329,7 @@ def backup_database():
         old_backup.unlink()
 
 def get_ai_business_context():
-    today = datetime.date.today()
+    today = datetime.datetime.now(TZ).date()
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     cursor.execute(
@@ -298,7 +361,7 @@ def get_ai_business_context():
         due_date = datetime.datetime.strptime(return_date, "%d.%m.%Y").date()
         overdue = "ПРОСРОЧЕН" if status == "active" and due_date <= today else "по графику"
         lines.append(
-            f"- Контракт #{rent_id}, {client_name}, ID {client_id}, статус {status}, "
+            f"- Контракт #{rent_id}, {escape_md(client_name)}, ID {client_id}, статус {status}, "
             f"следующее списание {return_date}, сумма {due_amount or 0} zł, "
             f"оплачено дней {paid_days}/{total_days}, {overdue}"
         )
@@ -307,7 +370,7 @@ def get_ai_business_context():
     if repair_debts:
         for debt_id, debtor_name, description, total_amount, paid_amount, status in repair_debts:
             lines.append(
-                f"- Долг #{debt_id}, {debtor_name}, {description}: "
+                f"- Долг #{debt_id}, {escape_md(debtor_name)}, {escape_md(description)}: "
                 f"остаток {total_amount - paid_amount} zł из {total_amount} zł"
             )
     else:
@@ -332,7 +395,7 @@ async def process_repair_wallet_payments(cursor):
             (wallet_id,)
         )
         rent_due = any(
-            datetime.datetime.strptime(row[0], "%d.%m.%Y").date() <= datetime.date.today()
+            datetime.datetime.strptime(row[0], "%d.%m.%Y").date() <= datetime.datetime.now(TZ).date()
             for row in cursor.fetchall()
         )
         if rent_due:
@@ -365,22 +428,22 @@ async def process_repair_wallet_payments(cursor):
                          f"{status_text}\n💰 Остаток кошелька: *{new_balance} zł*"
                 )
             except Exception:
-                pass
+                logger.exception("Не удалось отправить сообщение")
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_message(
                     chat_id=admin_id,
                     text=f"🛠 *Автосписание долга за ремонт*\n\n"
-                         f"👤 Клиент: *{debtor_name}*\n💵 Списано: *{payment} zł*\n"
+                         f"👤 Клиент: *{escape_md(debtor_name)}*\n💵 Списано: *{payment} zł*\n"
                          f"💰 Остаток кошелька: *{new_balance} zł*\n{status_text}"
                 )
             except Exception:
-                pass
+                logger.exception("Не удалось отправить сообщение")
 
 async def check_deadlines():
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
-    today = datetime.date.today()
+    today = datetime.datetime.now(TZ).date()
     tomorrow = today + datetime.timedelta(days=1)
 
     cursor.execute(
@@ -409,7 +472,7 @@ async def check_deadlines():
             await bot.send_message(chat_id=client_id, text=client_message)
             reminder_sent = True
         except Exception:
-            pass
+            logger.exception("Не удалось отправить сообщение")
 
         for admin_id in ADMIN_IDS:
             try:
@@ -418,7 +481,7 @@ async def check_deadlines():
                     text=(
                         "⏰ *Напоминание владельцу о завтрашнем списании*\n\n"
                         f"🆔 Контракт: *{rent_id}*\n"
-                        f"👤 Клиент: *{client_name}*\n"
+                        f"👤 Клиент: *{escape_md(client_name)}*\n"
                         f"📅 Дата списания: *{return_date}*\n"
                         f"🚲 Период: *{period_days} дн.*\n"
                         f"💰 К списанию: *{due_amount} zł*\n"
@@ -427,7 +490,7 @@ async def check_deadlines():
                 )
                 reminder_sent = True
             except Exception:
-                pass
+                logger.exception("Не удалось отправить сообщение")
 
         if reminder_sent:
             cursor.execute("UPDATE rents SET prepayment_notified = 1 WHERE id = ?", (rent_id,))
@@ -450,28 +513,20 @@ async def check_deadlines():
         lang = client_res[0] if client_res else "ru"
         balance = client_res[1] if client_res else 0
         
+        rent_info = {
+            "id": rent_id, "client_id": client_id, "client_name": client_name,
+            "amount": weekly_amount, "due_amount": due_amount, "return_date": return_date,
+            "current_week": current_week, "total_weeks": total_weeks, "paid_days": paid_days,
+            "period_days": period_days, "total_days": total_days,
+        }
         if balance >= due_amount:
-            operation_key = f"rent:{rent_id}:{paid_days}:{period_days}"
-            if not record_operation(cursor, operation_key, "rent_payment_auto", client_id, due_amount, f"Аренда №{rent_id}, {period_days} дн."):
+            result = charge_rent_period(cursor, rent_info, "auto")
+            if result is None:
                 continue
-            new_balance = balance - due_amount
-            cursor.execute("UPDATE clients SET balance = ? WHERE tg_id = ?", (new_balance, client_id))
-            new_paid_days = paid_days + period_days
-            
-            if new_paid_days < total_days:
-                next_week = current_week + 1
-                old_date = parse_date(return_date)
-                next_period_days = min(7, total_days - new_paid_days)
-                next_due_amount = math.ceil(weekly_amount * next_period_days / 7)
-                new_date = (old_date + datetime.timedelta(days=next_period_days)).strftime("%d.%m.%Y")
-                
-                cursor.execute(
-                    "UPDATE rents SET current_week = ?, paid_days = ?, period_days = ?, due_amount = ?, "
-                    "return_date = ?, is_notified = 0, prepayment_notified = 0, "
-                    "last_overdue_notified_at = NULL WHERE id = ?",
-                    (next_week, new_paid_days, next_period_days, next_due_amount, new_date, rent_id),
-                )
-                
+            new_balance = result["new_balance"]
+            new_paid_days = result["new_paid_days"]
+            new_date = result["next_date"]
+            if not result["completed"]:
                 try:
                     msg_client = (
                         f"💳 *Автоматическая оплата аренды!*\n\nС кошелька списано: *{due_amount} zł* за {period_days} дн.\n🚲 Оплачено дней: *{new_paid_days} из {total_days}*\n📅 Следующий платеж: *{new_date}*\n💰 Остаток: *{new_balance} zł*"
@@ -479,22 +534,25 @@ async def check_deadlines():
                         f"💳 *Автоматична оплата оренди!*\n\nЗ гаманця списано: *{due_amount} zł* за {period_days} дн.\n🚲 Оплачено днів: *{new_paid_days} з {total_days}*\n📅 Наступний платіж: *{new_date}*\n💰 Залишок: *{new_balance} zł*"
                     )
                     await bot.send_message(chat_id=client_id, text=msg_client)
-                except: pass
+                except Exception:
+                    logger.exception("Не удалось отправить сообщение")
                 
                 for admin_id in ADMIN_IDS:
                     try:
-                        await bot.send_message(chat_id=admin_id, text=f"✅ *Автооплата по кошельку!*\n\n🆔 *Контракт:* {rent_id}\n👤 *Клиент:* {client_name}\n🚲 *Оплачено дней:* {new_paid_days} из {total_days}\n💵 *Списано:* {due_amount} zł\n💰 *Остаток у клиента:* {new_balance} zł")
-                    except: pass
+                        await bot.send_message(chat_id=admin_id, text=f"✅ *Автооплата по кошельку!*\n\n🆔 *Контракт:* {rent_id}\n👤 *Клиент:* {escape_md(client_name)}\n🚲 *Оплачено дней:* {new_paid_days} из {total_days}\n💵 *Списано:* {due_amount} zł\n💰 *Остаток у клиента:* {new_balance} zł")
+                    except Exception:
+                        logger.exception("Не удалось отправить сообщение")
             else:
-                cursor.execute("UPDATE rents SET status = 'completed', is_notified = 1 WHERE id = ?", (rent_id,))
                 try:
                     await bot.send_message(chat_id=client_id, text=TEXTS[lang]["thank_you"].format(amount=due_amount) + "\n🎉 Контракт успешно завершен!")
-                except: pass
+                except Exception:
+                    logger.exception("Не удалось отправить сообщение")
                 
                 for admin_id in ADMIN_IDS:
                     try:
-                        await bot.send_message(chat_id=admin_id, text=f"🎉 *Контракт №{rent_id} полностью закрыт!*\n👤 *Клиент:* {client_name}\nВся сумма за весь срок успешно выплачена через кошелёк.")
-                    except: pass
+                        await bot.send_message(chat_id=admin_id, text=f"🎉 *Контракт №{rent_id} полностью закрыт!*\n👤 *Клиент:* {escape_md(client_name)}\nВся сумма за весь срок успешно выплачена через кошелёк.")
+                    except Exception:
+                        logger.exception("Не удалось отправить сообщение")
         else:
             due_date = parse_date(return_date)
             if not should_send_overdue_reminder(due_date, last_overdue_notified_at, today):
@@ -531,7 +589,7 @@ async def check_deadlines():
                         chat_id=admin_id,
                         text=(
                             "⚠️ *Долг! Недостаточно средств на кошельке!*\n\n"
-                            f"🆔 *Контракт:* {rent_id}\n👤 *Клиент:* {client_name}\n"
+                            f"🆔 *Контракт:* {rent_id}\n👤 *Клиент:* {escape_md(client_name)}\n"
                             f"⏱ *Статус:* {overdue_note}\n🚲 *Период:* {period_days} дн.\n"
                             f"💰 *Требуется:* {due_amount} zł\n🎒 *Баланс кошелька:* {balance} zł"
                         ),
@@ -567,17 +625,15 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if res:
         lang = res[0]
         client_menu = types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="🎒 Мой кошелёк / Мій гаманець")]], resize_keyboard=True)
-        await message.answer(TEXTS[lang]["welcome"].format(name=message.from_user.full_name, id=user_id), reply_markup=client_menu)
+        await message.answer(TEXTS[lang]["welcome"].format(name=escape_md(message.from_user.full_name), id=user_id), reply_markup=client_menu)
     else:
         builder = InlineKeyboardBuilder()
         builder.button(text="🇷🇺 Русский", callback_data="setlang_ru")
         builder.button(text="🇺🇦 Українська", callback_data="setlang_uk")
         await message.answer("🚲 Выберите язык интерфейса / Оберіть мову інтерфейсу:", reply_markup=builder.as_markup())
 
-@router.message(F.text == "⬅️ Назад в меню")
+@admin_router.message(F.text == "⬅️ Назад в меню")
 async def back_to_admin_menu(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     await state.clear()
     await message.answer(
         "↩️ Текущий сценарий отменён. Главное меню:",
@@ -603,7 +659,7 @@ async def process_set_lang(callback: types.CallbackQuery):
     conn.commit()
     conn.close()
     
-    welcome_msg = TEXTS[lang]["welcome"].format(name=user_name, id=user_id)
+    welcome_msg = TEXTS[lang]["welcome"].format(name=escape_md(user_name), id=user_id)
     client_menu = types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="🎒 Мой кошелёк / Мій гаманець")]], resize_keyboard=True)
     await callback.message.answer(welcome_msg, reply_markup=client_menu)
     await callback.answer()
@@ -621,16 +677,13 @@ async def text_open_wallet(message: types.Message):
     balance = res[1] if res else 0
     await message.answer(TEXTS[lang]["wallet"].format(balance=balance))
 
-@router.message(F.text == "➕ Оформить гибкий контракт")
+@admin_router.message(F.text == "➕ Оформить гибкий контракт")
 async def start_rent(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS: return
     await message.answer("👤 Шаг 1: Введите **имя клиента**:")
     await state.set_state(RentStates.waiting_for_client_name)
 
-@router.message(RentStates.waiting_for_client_name)
+@admin_router.message(RentStates.waiting_for_client_name)
 async def process_client_name(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     client_name = message.text.strip()
     if not client_name:
         await message.answer("❌ Имя не может быть пустым. Введите имя клиента:")
@@ -639,10 +692,8 @@ async def process_client_name(message: types.Message, state: FSMContext):
     await message.answer("🆔 Шаг 2: Введите **Telegram ID** клиента:")
     await state.set_state(RentStates.waiting_for_name)
 
-@router.message(RentStates.waiting_for_name)
+@admin_router.message(RentStates.waiting_for_name)
 async def process_client_id(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     if not message.text or not message.text.isdigit() or int(message.text) <= 0:
         await message.answer("❌ Введите положительный числовой Telegram ID клиента.")
         return
@@ -650,10 +701,8 @@ async def process_client_id(message: types.Message, state: FSMContext):
     await message.answer("💰 Шаг 3: Введите **цену за 1 неделю** аренды (в zł):")
     await state.set_state(RentStates.waiting_for_amount)
 
-@router.message(RentStates.waiting_for_amount)
+@admin_router.message(RentStates.waiting_for_amount)
 async def process_amount(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     if not message.text or not message.text.isdigit() or int(message.text) <= 0:
         await message.answer("❌ Введите положительный тариф за неделю целым числом.")
         return
@@ -661,24 +710,22 @@ async def process_amount(message: types.Message, state: FSMContext):
     await message.answer("⏳ Шаг 4: На сколько **ДНЕЙ** оформляется аренда?\n*(Например: 90 дней):*")
     await state.set_state(RentStates.waiting_for_duration)
 
-@router.message(RentStates.waiting_for_duration)
+@admin_router.message(RentStates.waiting_for_duration)
 async def process_duration(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     if not message.text or not message.text.isdigit():
         await message.answer("❌ Введите срок аренды положительным целым числом дней.")
         return
     total_days = int(message.text)
-    if total_days <= 0:
-        await message.answer("❌ Срок аренды должен быть хотя бы 1 день.")
+    if total_days < 0:
+        await message.answer("❌ Срок аренды не может быть отрицательным.")
         return
     weeks = max(1, math.ceil(total_days / 7))
     data = await state.get_data()
     weekly_amount = data['amount']
-    period_days = min(7, total_days)
+    period_days = min(7, total_days) if total_days else 1
     due_amount = math.ceil(weekly_amount * period_days / 7)
     client_id = data['c_id']
-    total_month_amount = math.ceil(weekly_amount * total_days / 7)
+    total_month_amount = math.ceil(weekly_amount * total_days / 7) if total_days else due_amount
     
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
@@ -687,8 +734,10 @@ async def process_duration(message: types.Message, state: FSMContext):
     c_name = data.get("client_name") or (c_res[0] if c_res else f"ID: {client_id}")
     lang = c_res[1] if c_res else "ru"
     
-    start_date = datetime.date.today()
-    return_date = (start_date + datetime.timedelta(days=period_days)).strftime("%d.%m.%Y")
+    start_date = datetime.datetime.now(TZ).date()
+    return_date = (
+        start_date if total_days == 0 else start_date + datetime.timedelta(days=period_days)
+    ).strftime("%d.%m.%Y")
     
     cursor.execute("""
         INSERT INTO rents (client_id, client_name, amount, return_date, total_month_amount, total_days, paid_days, period_days, due_amount, current_week, total_weeks, is_notified, status)
@@ -697,16 +746,18 @@ async def process_duration(message: types.Message, state: FSMContext):
     conn.commit()
     conn.close()
     
-    await message.answer(f"✅ Контракт успешно создан для *{c_name}*!\nДедлайн первой недели: {return_date}", reply_markup=get_admin_keyboard())
+    await message.answer(f"✅ Контракт успешно создан для *{escape_md(c_name)}*!\nДедлайн первой недели: {return_date}", reply_markup=get_admin_keyboard())
     
     try:
-        await bot.send_message(chat_id=client_id, text=TEXTS[lang]["invoice"].format(c_name=c_name, total_days=total_days, amount=weekly_amount, date=return_date))
-    except: pass
+        await bot.send_message(chat_id=client_id, text=TEXTS[lang]["invoice"].format(c_name=escape_md(c_name), total_days=total_days, amount=weekly_amount, date=return_date))
+    except Exception:
+        logger.exception("Не удалось отправить сообщение")
+    if total_days == 0:
+        await check_deadlines()
     await state.clear()
 
-@router.message(F.text == "📋 Список всех долгов")
+@admin_router.message(F.text == "📋 Список всех долгов")
 async def list_debts(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS: return
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT id, client_name, amount, due_amount, return_date, total_days, paid_days, current_week, total_weeks, client_id, status FROM rents")
@@ -729,7 +780,7 @@ async def list_debts(message: types.Message):
         builder.button(text="🗑 Удалить контракт", callback_data=f"delete_rent_{r_id}")
         
         total_contract_amount = math.ceil(amount * total_days / 7)
-        text = f"🆔 *Контракт №{r_id}*\n👤 Клиент: *{c_name}* (ID: `{c_id}`)\n📌 Статус: *{status_text}*\n💳 Тариф: *{amount} zł/неделя*\n📅 Срок: *{total_days} дней* ({tot_w} периодов)\n💰 Общая сумма: *{total_contract_amount} zł*\n🚲 Оплачено дней: *{paid_days} из {total_days}*\n💵 Ближайшее списание: *{due_amount or amount} zł*\n⏳ Срок платежа: *{r_date}*"
+        text = f"🆔 *Контракт №{r_id}*\n👤 Клиент: *{escape_md(c_name)}* (ID: `{c_id}`)\n📌 Статус: *{status_text}*\n💳 Тариф: *{amount} zł/неделя*\n📅 Срок: *{total_days} дней* ({tot_w} периодов)\n💰 Общая сумма: *{total_contract_amount} zł*\n🚲 Оплачено дней: *{paid_days} из {total_days}*\n💵 Ближайшее списание: *{due_amount or amount} zł*\n⏳ Срок платежа: *{r_date}*"
         await message.answer(text, reply_markup=builder.as_markup())
 
 def get_repair_debts_keyboard():
@@ -740,29 +791,23 @@ def get_repair_debts_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
-@router.message(F.text == "🛠 Долги за ремонт")
+@admin_router.message(F.text == "🛠 Долги за ремонт")
 async def open_repair_debts_panel(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     await message.answer(
         "🛠 *Панель долгов за ремонт*\n\n"
         "Здесь можно записать ремонт в долг, видеть остаток и отмечать частичные платежи.",
         reply_markup=get_repair_debts_keyboard()
     )
 
-@router.callback_query(F.data == "repair_add")
+@admin_router.callback_query(F.data == "repair_add")
 async def start_repair_debt(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        return
     await state.clear()
     await callback.message.answer("👤 Введите имя клиента или короткое описание, например: *Иван Петров*")
     await state.set_state(RentStates.waiting_for_repair_debtor_name)
     await callback.answer()
 
-@router.message(RentStates.waiting_for_repair_debtor_name)
+@admin_router.message(RentStates.waiting_for_repair_debtor_name)
 async def process_repair_debtor_name(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     name = message.text.strip()
     if not name:
         await message.answer("❌ Имя не может быть пустым.")
@@ -771,10 +816,8 @@ async def process_repair_debtor_name(message: types.Message, state: FSMContext):
     await message.answer("🆔 Введите Telegram ID клиента для уведомлений или `0`, если уведомлять только владельца:")
     await state.set_state(RentStates.waiting_for_repair_debtor_id)
 
-@router.message(RentStates.waiting_for_repair_debtor_id)
+@admin_router.message(RentStates.waiting_for_repair_debtor_id)
 async def process_repair_debtor_id(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     if not message.text.isdigit():
         await message.answer("❌ Введите числовой Telegram ID или `0`.")
         return
@@ -783,10 +826,8 @@ async def process_repair_debtor_id(message: types.Message, state: FSMContext):
     await message.answer("💰 Введите полную стоимость ремонта в zł, например: *700*")
     await state.set_state(RentStates.waiting_for_repair_amount)
 
-@router.message(RentStates.waiting_for_repair_amount)
+@admin_router.message(RentStates.waiting_for_repair_amount)
 async def process_repair_amount(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     if not message.text.isdigit() or int(message.text) <= 0:
         await message.answer("❌ Введите положительную сумму целым числом.")
         return
@@ -794,10 +835,8 @@ async def process_repair_amount(message: types.Message, state: FSMContext):
     await message.answer("🔧 Что ремонтировали? Например: *Замена камеры и настройка тормозов*")
     await state.set_state(RentStates.waiting_for_repair_description)
 
-@router.message(RentStates.waiting_for_repair_description)
+@admin_router.message(RentStates.waiting_for_repair_description)
 async def process_repair_description(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     description = message.text.strip()
     if not description:
         await message.answer("❌ Описание ремонта не может быть пустым.")
@@ -816,30 +855,30 @@ async def process_repair_description(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ *Долг за ремонт №{debt_id} записан!*\n\n"
-        f"👤 Клиент: *{data['repair_debtor_name']}*\n"
-        f"🔧 Работа: {description}\n"
+        f"👤 Клиент: *{escape_md(data['repair_debtor_name'])}*\n"
+        f"🔧 Работа: {escape_md(description)}\n"
         f"💰 Сумма: *{data['repair_total_amount']} zł*\n"
         f"📅 Создан: {created_at}",
         reply_markup=get_repair_debts_keyboard()
     )
     notification = (
         f"🛠 *У вас новый долг за ремонт №{debt_id}*\n\n"
-        f"🔧 Работа: {description}\n💰 К оплате: *{data['repair_total_amount']} zł*\n"
+        f"🔧 Работа: {escape_md(description)}\n💰 К оплате: *{data['repair_total_amount']} zł*\n"
         f"📅 Дата: {created_at}"
     )
     if data.get("repair_telegram_id"):
         try:
             await bot.send_message(chat_id=data["repair_telegram_id"], text=notification)
         except Exception:
-            pass
+            logger.exception("Не удалось отправить сообщение")
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 chat_id=admin_id,
-                text=f"🛠 *Записан долг за ремонт №{debt_id}*\n👤 Клиент: *{data['repair_debtor_name']}*\n💰 Сумма: *{data['repair_total_amount']} zł*"
+                text=f"🛠 *Записан долг за ремонт №{debt_id}*\n👤 Клиент: *{escape_md(data['repair_debtor_name'])}*\n💰 Сумма: *{data['repair_total_amount']} zł*"
             )
         except Exception:
-            pass
+            logger.exception("Не удалось отправить сообщение")
     await check_deadlines()
 
 async def send_repair_debts_list(target: types.Message | types.CallbackQuery):
@@ -862,8 +901,8 @@ async def send_repair_debts_list(target: types.Message | types.CallbackQuery):
         for debt_id, name, telegram_id, description, total, paid, created_at in debts:
             remaining = total - paid
             text += (
-                f"🆔 *№{debt_id}* — *{name}*\n"
-                f"🔧 {description}\n"
+                f"🆔 *№{debt_id}* — *{escape_md(name)}*\n"
+                f"🔧 {escape_md(description)}\n"
                 f"💳 Остаток: *{remaining} zł* из {total} zł | оплачено {paid} zł\n"
                 f"📅 {created_at}\n\n"
             )
@@ -880,26 +919,20 @@ async def send_repair_debts_list(target: types.Message | types.CallbackQuery):
     else:
         await target.answer(text, reply_markup=keyboard)
 
-@router.callback_query(F.data == "repair_list")
+@admin_router.callback_query(F.data == "repair_list")
 async def repair_debts_list_callback(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        return
     await send_repair_debts_list(callback)
 
-@router.callback_query(F.data.startswith("repair_pay_"))
+@admin_router.callback_query(F.data.startswith("repair_pay_"))
 async def start_repair_payment(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        return
     debt_id = int(callback.data.rsplit("_", 1)[1])
     await state.update_data(repair_debt_id=debt_id)
     await callback.message.answer(f"💵 Введите сумму платежа по долгу №{debt_id} в zł:")
     await state.set_state(RentStates.waiting_for_repair_payment)
     await callback.answer()
 
-@router.message(RentStates.waiting_for_repair_payment)
+@admin_router.message(RentStates.waiting_for_repair_payment)
 async def process_repair_payment(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     if not message.text.isdigit() or int(message.text) <= 0:
         await message.answer("❌ Введите положительную сумму целым числом.")
         return
@@ -949,7 +982,7 @@ async def process_repair_payment(message: types.Message, state: FSMContext):
     await state.clear()
     status_text = "✅ Долг полностью погашен!" if new_status == "paid" else f"Остаток: *{total_amount - new_paid} zł*."
     await message.answer(
-        f"💳 Платёж *{payment} zł* записан для *{name}*.\n{status_text}",
+        f"💳 Платёж *{payment} zł* записан для *{escape_md(name)}*.\n{status_text}",
         reply_markup=get_repair_debts_keyboard()
     )
     if telegram_id:
@@ -957,25 +990,23 @@ async def process_repair_payment(message: types.Message, state: FSMContext):
             await bot.send_message(
                 chat_id=telegram_id,
                 text=f"💳 *Платёж по долгу за ремонт получен: {payment} zł*\n"
-                     f"👤 Клиент: {name}\n"
+                     f"👤 Клиент: {escape_md(name)}\n"
                      f"💰 Остаток: *{total_amount - new_paid} zł*"
             )
         except Exception:
-            pass
+            logger.exception("Не удалось отправить сообщение")
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 chat_id=admin_id,
-                text=f"✅ *Оплата ремонта записана*\n👤 Клиент: *{name}*\n💵 Получено: *{payment} zł*\n"
+                text=f"✅ *Оплата ремонта записана*\n👤 Клиент: *{escape_md(name)}*\n💵 Получено: *{payment} zł*\n"
                      f"💰 Остаток: *{total_amount - new_paid} zł*"
             )
         except Exception:
-            pass
+            logger.exception("Не удалось отправить сообщение")
 
-@router.callback_query(F.data.startswith("repair_delete_"))
+@admin_router.callback_query(F.data.startswith("repair_delete_"))
 async def delete_repair_debt(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        return
     debt_id = int(callback.data.rsplit("_", 1)[1])
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
@@ -993,30 +1024,27 @@ async def delete_repair_debt(callback: types.CallbackQuery):
                     text=f"✅ *Долг за ремонт закрыт*\n💰 Оплачено: *{total_amount} zł*"
                 )
             except Exception:
-                pass
+                logger.exception("Не удалось отправить сообщение")
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_message(
                     chat_id=admin_id,
-                    text=f"✅ *Долг за ремонт №{debt_id} закрыт*\n👤 Клиент: *{name}*\n"
+                    text=f"✅ *Долг за ремонт №{debt_id} закрыт*\n👤 Клиент: *{escape_md(name)}*\n"
                          f"💰 Всего оплачено: *{total_amount} zł*"
                 )
             except Exception:
-                pass
+                logger.exception("Не удалось отправить сообщение")
     await callback.answer("Долг закрыт.")
     await send_repair_debts_list(callback)
 
-@router.callback_query(F.data == "repair_exit")
+@admin_router.callback_query(F.data == "repair_exit")
 async def exit_repair_debts(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        return
     await callback.message.edit_text("↩️ Вы вышли из панели долгов за ремонт.")
     await callback.message.answer("Главное меню:", reply_markup=get_admin_keyboard())
     await callback.answer()
 
-@router.callback_query(F.data.startswith("close_"))
+@admin_router.callback_query(F.data.startswith("close_"))
 async def cb_close_rent(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS: return
     await state.clear()
     rent_id = int(callback.data.split("_")[-1])
     conn = sqlite3.connect(DATABASE_PATH)
@@ -1034,30 +1062,26 @@ async def cb_close_rent(callback: types.CallbackQuery, state: FSMContext):
         cursor.execute("SELECT lang FROM clients WHERE tg_id = ?", (client_id,))
         lang_res = cursor.fetchone()
         lang = lang_res[0] if lang_res else "ru"
-        operation_key = f"rent:{rent_id}:{paid_days}:{period_days}:manual"
-        due_amount = due_amount or weekly_amount
-        if not record_operation(cursor, operation_key, "rent_payment_manual", client_id, due_amount, f"Ручная оплата аренды №{rent_id}"):
+        result = charge_rent_period(cursor, {
+            "id": rent_id, "client_id": client_id, "client_name": "",
+            "amount": weekly_amount, "due_amount": due_amount, "return_date": old_date_str,
+            "current_week": current_week, "total_weeks": total_weeks, "paid_days": paid_days,
+            "period_days": period_days, "total_days": total_days,
+        }, "manual")
+        if result is None:
             conn.close()
-            await callback.answer("Этот платёж уже обработан.", show_alert=True)
+            await callback.answer("Недостаточно средств или этот платёж уже обработан.", show_alert=True)
             return
-        
+        due_amount = result["charged"]
+        new_paid_days = result["new_paid_days"]
         try:
             await bot.send_message(chat_id=client_id, text=TEXTS[lang]["thank_you"].format(amount=due_amount))
-        except: pass
+        except Exception:
+            logger.exception("Не удалось отправить сообщение chat_id=%s", client_id)
         
-        new_paid_days = paid_days + period_days
-        if new_paid_days < total_days:
-            next_week = current_week + 1
-            old_date = parse_date(old_date_str)
+        if not result["completed"]:
+            new_date = result["next_date"]
             next_period_days = min(7, total_days - new_paid_days)
-            next_due_amount = math.ceil(weekly_amount * next_period_days / 7)
-            new_date = (old_date + datetime.timedelta(days=next_period_days)).strftime("%d.%m.%Y")
-            cursor.execute(
-                "UPDATE rents SET current_week = ?, paid_days = ?, period_days = ?, due_amount = ?, "
-                "return_date = ?, is_notified = 0, prepayment_notified = 0, "
-                "last_overdue_notified_at = NULL WHERE id = ?",
-                (next_week, new_paid_days, next_period_days, next_due_amount, new_date, rent_id),
-            )
             await callback.message.edit_text(f"💳 Оплачено {period_days} дн. на сумму {due_amount} zł! Следующий период: {next_period_days} дн. (до {new_date}).")
             for admin_id in ADMIN_IDS:
                 try:
@@ -1069,9 +1093,8 @@ async def cb_close_rent(callback: types.CallbackQuery, state: FSMContext):
                              f"🚲 Оплачено дней: *{new_paid_days} из {total_days}*"
                     )
                 except Exception:
-                    pass
+                    logger.exception("Не удалось отправить сообщение")
         else:
-            cursor.execute("UPDATE rents SET status = 'completed', paid_days = total_days, is_notified = 1 WHERE id = ?", (rent_id,))
             await callback.message.edit_text(f"🎉 Все {total_days} дней оплачены! Контракт закрыт.")
             for admin_id in ADMIN_IDS:
                 try:
@@ -1082,24 +1105,21 @@ async def cb_close_rent(callback: types.CallbackQuery, state: FSMContext):
                              f"🚲 Все {total_days} дней закрыты."
                     )
                 except Exception:
-                    pass
+                    logger.exception("Не удалось отправить сообщение")
     conn.commit()
     conn.close()
     await callback.answer()
 
-@router.callback_query(F.data.startswith("extend_"))
+@admin_router.callback_query(F.data.startswith("extend_"))
 async def cb_extend_rent(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS: return
     rent_id = int(callback.data.split("_")[-1])
     await state.update_data(extend_rent_id=rent_id)
     await callback.message.answer("На сколько **ДОПОЛНИТЕЛЬНЫХ дней** перенести срок?\n*(Введите число кратное 7, например: 7, 14, 21, 28 или 0 для принудительного сброса автосписания):*")
     await state.set_state(RentStates.waiting_for_extra_days)
     await callback.answer()
 
-@router.callback_query(F.data.startswith("delete_rent_"))
+@admin_router.callback_query(F.data.startswith("delete_rent_"))
 async def cb_delete_rent(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        return
 
     rent_id = int(callback.data.rsplit("_", 1)[1])
     conn = sqlite3.connect(DATABASE_PATH)
@@ -1115,14 +1135,14 @@ async def cb_delete_rent(callback: types.CallbackQuery):
     conn.commit()
     conn.close()
     await callback.message.edit_text(
-        f"🗑 Контракт №{rent_id} клиента *{rent[0]}* удалён.\n"
+        f"🗑 Контракт №{rent_id} клиента *{escape_md(rent[0])}* удалён.\n"
         "Кошелёк клиента сохранён."
     )
     await callback.answer()
 
-@router.message(RentStates.waiting_for_extra_days)
+@admin_router.message(RentStates.waiting_for_extra_days)
 async def process_extra_days(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS or not message.text.isdigit(): return
+    if not message.text or not message.text.isdigit(): return
     extra_days = int(message.text)
     if extra_days <= 0:
         await message.answer("❌ Укажите положительное количество дополнительных дней.")
@@ -1151,7 +1171,7 @@ async def process_extra_days(message: types.Message, state: FSMContext):
         next_period_days = min(7, remaining_days)
         next_due_amount = math.ceil(weekly_amount * next_period_days / 7)
         if paid_days >= old_total_days:
-            new_date = datetime.date.today().strftime("%d.%m.%Y")
+            new_date = datetime.datetime.now(TZ).date().strftime("%d.%m.%Y")
         cursor.execute(
             "UPDATE rents SET return_date = ?, total_weeks = ?, total_days = ?, period_days = ?, due_amount = ?, total_month_amount = ?, is_notified = 0, status = 'active' WHERE id = ?",
             (new_date, new_total_weeks, new_total_days, next_period_days, next_due_amount, new_total_amount, rent_id)
@@ -1162,45 +1182,56 @@ async def process_extra_days(message: types.Message, state: FSMContext):
     conn.close()
     await state.clear()
 
-@router.message(F.text == "💰 Пополнить баланс кошелька")
+@admin_router.message(F.text == "💰 Пополнить баланс кошелька")
 async def start_deposit_buttons(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS: return
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT client_id, client_name FROM rents")
-    active_clients = cursor.fetchall()
+    clients_by_id = {}
+    cursor.execute("SELECT tg_id AS id, name FROM clients")
+    for client_id, name in cursor.fetchall():
+        clients_by_id[client_id] = name
+    cursor.execute(
+        "SELECT DISTINCT client_id AS id, client_name AS name "
+        "FROM rents WHERE client_id IS NOT NULL"
+    )
+    for client_id, name in cursor.fetchall():
+        if client_id not in clients_by_id or not clients_by_id[client_id]:
+            clients_by_id[client_id] = name
+    active_clients = list(clients_by_id.items())
     conn.close()
     
     if not active_clients:
-        await message.answer("❌ Сейчас нет активных контрактов, кошелёк некому пополнять!")
+        await message.answer("❌ В базе пока нет клиентов для пополнения.")
         return
         
     builder = InlineKeyboardBuilder()
     for client_id, client_name in active_clients:
-        builder.button(text=f"👤 {client_name}", callback_data=f"dep_cli_{client_id}")
+        builder.button(text=f"👤 {escape_md(client_name)}", callback_data=f"dep_cli_{client_id}")
     builder.adjust(1)
     await message.answer("👇 Выберите клиента для пополнения баланса из списка:", reply_markup=builder.as_markup())
 
-@router.callback_query(F.data.startswith("dep_cli_"))
+@admin_router.callback_query(F.data.startswith("dep_cli_"))
 async def cb_select_client_for_deposit(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS: return
     client_id = int(callback.data.split("_")[-1])
     
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT client_name FROM rents WHERE client_id = ? ORDER BY id DESC LIMIT 1", (client_id,))
+    cursor.execute(
+        "SELECT COALESCE((SELECT name FROM clients WHERE tg_id = ?), "
+        "(SELECT client_name FROM rents WHERE client_id = ? ORDER BY id DESC LIMIT 1))",
+        (client_id, client_id),
+    )
     res = cursor.fetchone()
     conn.close()
     
     client_name = res[0] if res else f"ID: {client_id}"
     await state.update_data(deposit_client_id=client_id, deposit_client_name=client_name)
-    await callback.message.answer(f"💰 Вы выбрали клиента: *{client_name}*\n\nВведите **сумму пополнения** в zł (только число):")
+    await callback.message.answer(f"💰 Вы выбрали клиента: *{escape_md(client_name)}*\n\nВведите **сумму пополнения** в zł (только число):")
     await state.set_state(RentStates.waiting_for_deposit_amount)
     await callback.answer()
 
-@router.message(RentStates.waiting_for_deposit_amount)
+@admin_router.message(RentStates.waiting_for_deposit_amount)
 async def process_deposit_amount(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS: return
     if not message.text.isdigit() or int(message.text) <= 0:
         await message.answer("❌ Пожалуйста, введите корректное число (сумму в zł)!")
         return
@@ -1234,14 +1265,14 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
     )
     conn.commit()
     
-    today_str = datetime.date.today().strftime("%d.%m.%Y")
+    today_str = datetime.datetime.now(TZ).date().strftime("%d.%m.%Y")
     cursor.execute(
         "SELECT id, amount, due_amount, return_date, current_week, total_weeks, paid_days, period_days, total_days "
         "FROM rents WHERE client_id = ? AND status = 'active' ORDER BY id ASC",
         (client_id,)
     )
     rent_res = None
-    today = datetime.date.today()
+    today = datetime.datetime.now(TZ).date()
     for candidate in cursor.fetchall():
         candidate_date = datetime.datetime.strptime(candidate[3], "%d.%m.%Y").date()
         if candidate_date <= today:
@@ -1252,45 +1283,49 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
         rent_id, weekly_amount, rent_amount, return_date, current_week, total_weeks, paid_days, period_days, total_days = rent_res
         rent_amount = rent_amount or weekly_amount
         if new_balance >= rent_amount:
-            new_balance = new_balance - rent_amount
-            cursor.execute("UPDATE clients SET balance = ? WHERE tg_id = ?", (new_balance, client_id))
-            
-            new_paid_days = paid_days + period_days
-            if new_paid_days < total_days:
-                next_week = current_week + 1
-                old_date = datetime.datetime.strptime(return_date, "%d.%m.%Y").date()
+            result = charge_rent_period(cursor, {
+                "id": rent_id, "client_id": client_id, "client_name": client_name,
+                "amount": weekly_amount, "due_amount": rent_amount, "return_date": return_date,
+                "current_week": current_week, "total_weeks": total_weeks, "paid_days": paid_days,
+                "period_days": period_days, "total_days": total_days,
+            }, "deposit")
+            if result is None:
+                conn.close()
+                await state.clear()
+                return
+            new_balance = result["new_balance"]
+            new_paid_days = result["new_paid_days"]
+            if not result["completed"]:
+                new_date = result["next_date"]
                 next_period_days = min(7, total_days - new_paid_days)
-                next_due_amount = math.ceil(weekly_amount * next_period_days / 7)
-                new_date = (old_date + datetime.timedelta(days=next_period_days)).strftime("%d.%m.%Y")
-                cursor.execute("UPDATE rents SET current_week = ?, paid_days = ?, period_days = ?, due_amount = ?, return_date = ?, is_notified = 0 WHERE id = ?", (next_week, new_paid_days, next_period_days, next_due_amount, new_date, rent_id))
-                
                 try:
                     msg_client = (
-                        f"💳 *Автоматическая оплата аренды!*\n\nС кошелька списано: *{rent_amount} zł*\n🚲 Неделя: *{next_week} из {total_weeks}*\n📅 Следующий платеж: *{new_date}*\n💰 Остаток на балансе: *{new_balance} zł*"
+                        f"💳 *Автоматическая оплата аренды!*\n\nС кошелька списано: *{rent_amount} zł*\n🚲 Следующий период: *{next_period_days} дн.*\n📅 Следующий платеж: *{new_date}*\n💰 Остаток на балансе: *{new_balance} zł*"
                         if lang == "ru" else
-                        f"💳 *Автоматична оплата оренди!*\n\nЗ гаманця списано: *{rent_amount} zł*\n🚲 Тиждень: *{next_week} з {total_weeks}*\n📅 Наступний платіж: *{new_date}*\n💰 Залишок на балансі: *{new_balance} zł*"
+                        f"💳 *Автоматична оплата оренди!*\n\nЗ гаманця списано: *{rent_amount} zł*\n🚲 Наступний період: *{next_period_days} дн.*\n📅 Наступний платіж: *{new_date}*\n💰 Залишок на балансі: *{new_balance} zł*"
                     )
                     await bot.send_message(chat_id=client_id, text=msg_client)
-                except: pass
+                except Exception:
+                    logger.exception("Не удалось отправить сообщение chat_id=%s", client_id)
             else:
-                cursor.execute("UPDATE rents SET status = 'completed', paid_days = total_days, is_notified = 1 WHERE id = ?", (rent_id,))
                 try:
                     await bot.send_message(chat_id=client_id, text=TEXTS[lang]["thank_you"].format(amount=rent_amount) + "\n🎉 Контракт успешно завершен!")
-                except: pass
+                except Exception:
+                    logger.exception("Не удалось отправить сообщение chat_id=%s", client_id)
             
-            await message.answer(f"✅ Баланс пополнен и **СРАЗУ СПИСАН** за аренду!\n\n👤 Клиент: *{client_name}*\n💵 Списано за период: *{rent_amount} zł*\n🚲 Оплачено дней: *{paid_days + period_days} из {total_days}*\n💰 Чистый остаток: *{new_balance} zł*", reply_markup=get_admin_keyboard())
+            await message.answer(f"✅ Баланс пополнен и **СРАЗУ СПИСАН** за аренду!\n\n👤 Клиент: *{escape_md(client_name)}*\n💵 Списано за период: *{rent_amount} zł*\n🚲 Оплачено дней: *{paid_days + period_days} из {total_days}*\n💰 Чистый остаток: *{new_balance} zł*", reply_markup=get_admin_keyboard())
             for admin_id in ADMIN_IDS:
                 try:
                     await bot.send_message(
                         chat_id=admin_id,
                         text=f"💰 *Кошелёк пополнен и платёж списан*\n\n"
-                             f"👤 Клиент: *{client_name}*\n"
+                             f"👤 Клиент: *{escape_md(client_name)}*\n"
                              f"➕ Внесено владельцу: *{amount_to_add} zł*\n"
                              f"💳 Списано за аренду: *{rent_amount} zł*\n"
                              f"💰 Остаток клиента: *{new_balance} zł*"
                     )
                 except Exception:
-                    pass
+                    logger.exception("Не удалось отправить сообщение")
             conn.commit()
             conn.close()
             await check_deadlines()
@@ -1299,18 +1334,18 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
 
     conn.close()
     await check_deadlines()
-    await message.answer(f"✅ Баланс успешно пополнен!\n👤 Клиент: *{client_name}*\n➕ Зачислено: +{amount_to_add} zł\n💰 Новый баланс: *{new_balance} zł*", reply_markup=get_admin_keyboard())
+    await message.answer(f"✅ Баланс успешно пополнен!\n👤 Клиент: *{escape_md(client_name)}*\n➕ Зачислено: +{amount_to_add} zł\n💰 Новый баланс: *{new_balance} zł*", reply_markup=get_admin_keyboard())
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 chat_id=admin_id,
                 text=f"💰 *Кошелёк клиента пополнен*\n\n"
-                     f"👤 Клиент: *{client_name}*\n"
+                     f"👤 Клиент: *{escape_md(client_name)}*\n"
                      f"➕ Внесено владельцу: *{amount_to_add} zł*\n"
                      f"💰 Баланс клиента: *{new_balance} zł*"
             )
         except Exception:
-            pass
+            logger.exception("Не удалось отправить сообщение")
     try:
         msg_text = (
             f"🎉 *Баланс вашего кошелька пополнен!*\n\n➕ Зачислено: *{amount_to_add} zł*\n💰 Текущий баланс: *{new_balance} zł*"
@@ -1318,7 +1353,8 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
             f"🎉 *Баланс вашого гаманця поповнено!*\n\n➕ Зараховано: *{amount_to_add} zł*\n💰 Поточний баланс: *{new_balance} zł*"
         )
         await bot.send_message(chat_id=client_id, text=msg_text)
-    except: pass
+    except Exception:
+        logger.exception("Не удалось отправить сообщение")
     if rent_res:
         _, weekly_amount, rent_amount, _, _, _, _, _, _ = rent_res
         rent_amount = rent_amount or weekly_amount
@@ -1332,23 +1368,22 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
             try:
                 await bot.send_message(chat_id=client_id, text=reminder)
             except Exception:
-                pass
+                logger.exception("Не удалось отправить сообщение")
             for admin_id in ADMIN_IDS:
                 try:
                     await bot.send_message(
                         chat_id=admin_id,
                         text=f"⚠️ *Недостаточно средств после пополнения*\n"
-                             f"👤 Клиент: *{client_name}*\n"
+                             f"👤 Клиент: *{escape_md(client_name)}*\n"
                              f"💰 Баланс: *{new_balance} zł*, требуется *{rent_amount} zł*\n"
                              f"➕ Не хватает: *{remaining} zł*"
                     )
                 except Exception:
-                    pass
+                    logger.exception("Не удалось отправить сообщение")
     await state.clear()
 
-@router.message(F.text == "📊 Статистика доходов")
+@admin_router.message(F.text == "📊 Статистика доходов")
 async def show_statistics(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS: return
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM rents WHERE status = 'active'")
@@ -1370,10 +1405,8 @@ async def show_statistics(message: types.Message):
     )
     await message.answer(text)
 
-@router.message(F.text == "📜 История операций")
+@admin_router.message(F.text == "📜 История операций")
 async def show_operations_history(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     cursor.execute(
@@ -1395,12 +1428,11 @@ async def show_operations_history(message: types.Message):
     lines = ["📜 *Последние операции:*\n"]
     for operation_type, client_id, amount, description, created_at in operations:
         label = labels.get(operation_type, operation_type)
-        lines.append(f"• `{created_at}` — *{label}*: {amount} zł\n  {description} (ID: `{client_id}`)")
+        lines.append(f"• `{created_at}` — *{label}*: {amount} zł\n  {escape_md(description)} (ID: `{client_id}`)")
     await message.answer("\n".join(lines))
 
-@router.message(F.text == "🧠 ИИ-Помощник")
+@admin_router.message(F.text == "🧠 ИИ-Помощник")
 async def open_ai_panel(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS: return
     text = "🧠 *ИИ-помощник владельца проката*\n\nИИ видит текущие контракты, кошельки, просрочки и долги за ремонт. Он может проанализировать ситуацию, подсказать действия или ответить на ваш вопрос."
     await message.answer(text, reply_markup=get_ai_panel_keyboard())
 
@@ -1440,9 +1472,8 @@ async def send_ai_result(message, prompt):
             reply_markup=get_ai_panel_keyboard(),
         )
 
-@router.callback_query(F.data == "ai_debt_analysis")
+@admin_router.callback_query(F.data == "ai_debt_analysis")
 async def cb_ai_debt_analysis(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS: return
     await callback.message.answer("⏳ Анализирую текущие долги, просрочки и балансы...")
     await send_ai_result(
         callback.message,
@@ -1451,9 +1482,8 @@ async def cb_ai_debt_analysis(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-@router.callback_query(F.data == "ai_recommendations")
+@admin_router.callback_query(F.data == "ai_recommendations")
 async def cb_ai_recommendations(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS: return
     await callback.message.answer("⏳ Формирую рекомендации по работе проката...")
     await send_ai_result(
         callback.message,
@@ -1463,17 +1493,15 @@ async def cb_ai_recommendations(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data == "ai_custom_question")
+@admin_router.callback_query(F.data == "ai_custom_question")
 async def cb_ai_custom(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS: return
     await callback.message.answer("❓ Введите любой ваш вопрос или задачу для ИИ обычным текстом (без всяких команд):")
     await state.set_state(RentStates.waiting_for_ai_prompt)
     await callback.answer()
 
 # 3. Режим свободного вопроса к ИИ
-@router.message(RentStates.waiting_for_ai_prompt)
+@admin_router.message(RentStates.waiting_for_ai_prompt)
 async def process_ai_custom(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS: return
     prompt = message.text.strip()
     if not prompt:
         await message.answer("❌ Вопрос не может быть пустым.")
@@ -1484,18 +1512,15 @@ async def process_ai_custom(message: types.Message, state: FSMContext):
 
 
 
-@router.callback_query(F.data == "ai_exit")
+@admin_router.callback_query(F.data == "ai_exit")
 async def cb_ai_exit(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS: return
     await state.clear()
     await callback.message.edit_text("↩️ Вы вышли из ИИ-панели.", reply_markup=None)
     await callback.message.answer("Главное меню админа:", reply_markup=get_admin_keyboard())
     await callback.answer()
 
-@router.message(F.text == "❌ Очистить всю базу")
+@admin_router.message(F.text == "❌ Очистить всю базу")
 async def clear_database_cmd(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     await message.answer(
         "⚠️ *Удаление всей базы*\n\n"
         "Будут удалены все контракты, клиенты и балансы.\n"
@@ -1503,10 +1528,8 @@ async def clear_database_cmd(message: types.Message, state: FSMContext):
     )
     await state.set_state(RentStates.waiting_for_clear_pin)
 
-@router.message(RentStates.waiting_for_clear_pin)
+@admin_router.message(RentStates.waiting_for_clear_pin)
 async def process_clear_database_pin(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
     if message.text.strip() != "7777":
         await message.answer("❌ Неверный PIN. Очистка отменена.")
         await state.clear()
@@ -1526,9 +1549,22 @@ async def process_clear_database_pin(message: types.Message, state: FSMContext):
         reply_markup=get_admin_keyboard()
     )
 
+
+@admin_router.message(~F.text.startswith("/start"))
+async def fallback_admin(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Не понял команду. Похоже, диалог сбросился (например, после перезапуска бота). "
+        "Выберите действие в меню:",
+        reply_markup=get_admin_keyboard()
+    )
+
+
 async def main():
     init_db()
     backup_database()
+    dp.include_router(admin_router)
+    dp.include_router(router)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_deadlines, "interval", minutes=1)
     scheduler.add_job(backup_database, "interval", hours=24)
